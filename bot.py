@@ -1,9 +1,11 @@
 import logging
-import sqlite3
 import re
 import os
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 import pytz
+import psycopg2
+import psycopg2.extras
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -13,8 +15,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+MOSCOW_TZ    = pytz.timezone('Europe/Moscow')
 
 # ── Состояния ──
 STATE_IDLE             = None
@@ -30,60 +33,97 @@ bot_state = {"mode": STATE_IDLE, "temp": {}}
 
 
 # ════════════════════════════════════
-#  БАЗА ДАННЫХ
+#  БАЗА ДАННЫХ (PostgreSQL)
 # ════════════════════════════════════
 
+@contextmanager
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def db_execute(query, params=()):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+
+def db_fetchone(query, params=()):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+
+def db_fetchall(query, params=()):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+
 def init_db():
-    with sqlite3.connect("bot.db") as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                text          TEXT    NOT NULL,
-                done          INTEGER DEFAULT 0,
-                priority      INTEGER DEFAULT 0,
-                date          TEXT    NOT NULL,
-                original_date TEXT
-            );
-            CREATE TABLE IF NOT EXISTS reminders (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                text      TEXT NOT NULL,
-                remind_at TEXT NOT NULL,
-                sent      INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS notes (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                text       TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS habits (
-                id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                name   TEXT NOT NULL,
-                active INTEGER DEFAULT 1
-            );
-            CREATE TABLE IF NOT EXISTS habit_log (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                habit_id INTEGER NOT NULL,
-                date     TEXT    NOT NULL,
-                UNIQUE(habit_id, date)
-            );
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        try:
-            c.execute("ALTER TABLE tasks ADD COLUMN priority INTEGER DEFAULT 0")
-        except Exception:
-            pass
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id            SERIAL PRIMARY KEY,
+                    text          TEXT    NOT NULL,
+                    done          INTEGER DEFAULT 0,
+                    priority      INTEGER DEFAULT 0,
+                    date          TEXT    NOT NULL,
+                    original_date TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id        SERIAL PRIMARY KEY,
+                    text      TEXT NOT NULL,
+                    remind_at TEXT NOT NULL,
+                    sent      INTEGER DEFAULT 0
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notes (
+                    id         SERIAL PRIMARY KEY,
+                    text       TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS habits (
+                    id     SERIAL PRIMARY KEY,
+                    name   TEXT NOT NULL,
+                    active INTEGER DEFAULT 1
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS habit_log (
+                    id       SERIAL PRIMARY KEY,
+                    habit_id INTEGER NOT NULL,
+                    date     TEXT    NOT NULL,
+                    UNIQUE(habit_id, date)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
 
 def get_setting(key):
-    with sqlite3.connect("bot.db") as c:
-        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    row = db_fetchone("SELECT value FROM settings WHERE key=%s", (key,))
     return row[0] if row else None
 
 def set_setting(key, value):
-    with sqlite3.connect("bot.db") as c:
-        c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(value)))
+    db_execute(
+        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+        (key, str(value))
+    )
 
 def today_str():
     return datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
@@ -92,30 +132,26 @@ def tomorrow_str():
     return (datetime.now(MOSCOW_TZ) + timedelta(days=1)).strftime("%d.%m.%Y")
 
 def get_tasks(date, done=None):
-    q = "SELECT id, text, done, priority, original_date FROM tasks WHERE date=?"
+    q = "SELECT id, text, done, priority, original_date FROM tasks WHERE date=%s"
     p = [date]
     if done is not None:
-        q += " AND done=?"
+        q += " AND done=%s"
         p.append(done)
     q += " ORDER BY priority DESC, id"
-    with sqlite3.connect("bot.db") as c:
-        return c.execute(q, p).fetchall()
+    return db_fetchall(q, p)
 
 def get_habits():
-    with sqlite3.connect("bot.db") as c:
-        return c.execute("SELECT id, name FROM habits WHERE active=1 ORDER BY id").fetchall()
+    return db_fetchall("SELECT id, name FROM habits WHERE active=1 ORDER BY id")
 
 def is_habit_done(habit_id, date):
-    with sqlite3.connect("bot.db") as c:
-        return bool(c.execute(
-            "SELECT 1 FROM habit_log WHERE habit_id=? AND date=?", (habit_id, date)
-        ).fetchone())
+    return bool(db_fetchone(
+        "SELECT 1 FROM habit_log WHERE habit_id=%s AND date=%s", (habit_id, date)
+    ))
 
 def get_streak(habit_id):
-    with sqlite3.connect("bot.db") as c:
-        rows = c.execute(
-            "SELECT date FROM habit_log WHERE habit_id=? ORDER BY date DESC", (habit_id,)
-        ).fetchall()
+    rows = db_fetchall(
+        "SELECT date FROM habit_log WHERE habit_id=%s ORDER BY date DESC", (habit_id,)
+    )
     if not rows:
         return 0
     streak   = 0
@@ -255,15 +291,12 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если уже есть заметки — показываем их, иначе входим в режим добавления
-    with sqlite3.connect("bot.db") as c:
-        count = c.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    row = db_fetchone("SELECT COUNT(*) FROM notes")
+    count = row[0] if row else 0
 
     if count > 0 and bot_state["mode"] != STATE_ADDING_NOTE:
         # Показываем список + предлагаем добавить
-        with sqlite3.connect("bot.db") as c:
-            notes = c.execute(
-                "SELECT text, created_at FROM notes ORDER BY id DESC LIMIT 15"
-            ).fetchall()
+        notes = db_fetchall("SELECT text, created_at FROM notes ORDER BY id DESC LIMIT 15")
         lines = [f"📌 _{n[1]}_\n{n[0]}" for n in notes]
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить заметку", callback_data="note_add")]])
         await update.message.reply_text(
@@ -282,10 +315,7 @@ async def cmd_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔔 Напиши текст напоминания:")
 
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect("bot.db") as c:
-        rows = c.execute(
-            "SELECT text, remind_at FROM reminders WHERE sent=0 ORDER BY remind_at"
-        ).fetchall()
+    rows = db_fetchall("SELECT text, remind_at FROM reminders WHERE sent=0 ORDER BY remind_at")
     if not rows:
         await update.message.reply_text("Нет предстоящих напоминаний.")
         return
@@ -305,11 +335,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отметить задачу выполненной
     if data.startswith("done_"):
         tid = int(data.split("_")[1])
-        with sqlite3.connect("bot.db") as c:
-            row = c.execute("SELECT date FROM tasks WHERE id=?", (tid,)).fetchone()
-            if row:
-                c.execute("UPDATE tasks SET done=1 WHERE id=?", (tid,))
-                date = row[0]
+        row = db_fetchone("SELECT date FROM tasks WHERE id=%s", (tid,))
+        if row:
+            db_execute("UPDATE tasks SET done=1 WHERE id=%s", (tid,))
+            date = row[0]
         await query.answer("✅ Выполнено!")
         kb = build_task_kb(date)
         if kb:
@@ -346,8 +375,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Удалить
     if data.startswith("delete_"):
         tid = int(data.split("_")[1])
-        with sqlite3.connect("bot.db") as c:
-            c.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        db_execute("DELETE FROM tasks WHERE id=%s", (tid,))
         await query.answer("🗑 Удалено")
         kb = build_task_kb(today)
         if kb:
@@ -360,14 +388,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("postpone_"):
         tid      = int(data.split("_")[1])
         tomorrow = tomorrow_str()
-        with sqlite3.connect("bot.db") as c:
-            row = c.execute("SELECT text, original_date, priority FROM tasks WHERE id=?", (tid,)).fetchone()
-            if row:
-                c.execute("DELETE FROM tasks WHERE id=?", (tid,))
-                c.execute(
-                    "INSERT INTO tasks (text, priority, date, original_date) VALUES (?,?,?,?)",
-                    (row[0], row[2], tomorrow, row[1] or today)
-                )
+        row = db_fetchone("SELECT text, original_date, priority FROM tasks WHERE id=%s", (tid,))
+        if row:
+            db_execute("DELETE FROM tasks WHERE id=%s", (tid,))
+            db_execute(
+                "INSERT INTO tasks (text, priority, date, original_date) VALUES (%s,%s,%s,%s)",
+                (row[0], row[2], tomorrow, row[1] or today)
+            )
         await query.answer("➡️ Перенесено на завтра")
         kb = build_task_kb(today)
         if kb:
@@ -379,8 +406,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Выбрать задачу для редактирования
     if data.startswith("edit_"):
         tid = int(data.split("_")[1])
-        with sqlite3.connect("bot.db") as c:
-            row = c.execute("SELECT text FROM tasks WHERE id=?", (tid,)).fetchone()
+        row = db_fetchone("SELECT text FROM tasks WHERE id=%s", (tid,))
         if row:
             bot_state["mode"] = STATE_EDITING_TASK
             bot_state["temp"]["edit_id"] = tid
@@ -396,14 +422,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("habit_") and data != "habit_add":
         hid  = int(data.split("_")[1])
         done = is_habit_done(hid, today)
-        with sqlite3.connect("bot.db") as c:
-            if done:
-                c.execute("DELETE FROM habit_log WHERE habit_id=? AND date=?", (hid, today))
-                await query.answer("↩️ Отменено")
-            else:
-                c.execute("INSERT OR IGNORE INTO habit_log (habit_id, date) VALUES (?,?)", (hid, today))
-                streak = get_streak(hid)
-                await query.answer("✅" + (f" 🔥{streak} дней подряд!" if streak > 1 else " Выполнено!"))
+        if done:
+            db_execute("DELETE FROM habit_log WHERE habit_id=%s AND date=%s", (hid, today))
+            await query.answer("↩️ Отменено")
+        else:
+            db_execute("INSERT INTO habit_log (habit_id, date) VALUES (%s,%s) ON CONFLICT DO NOTHING", (hid, today))
+            streak = get_streak(hid)
+            await query.answer("✅" + (f" 🔥{streak} дней подряд!" if streak > 1 else " Выполнено!"))
         await query.edit_message_reply_markup(reply_markup=build_habit_kb(today))
         return
 
@@ -461,16 +486,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не смог разобрать. Каждая задача — с новой строки.")
             return
 
-        with sqlite3.connect("bot.db") as c:
-            c.execute(
-                "DELETE FROM tasks WHERE date=? AND (original_date IS NULL OR original_date=?)",
-                (today, today)
+        db_execute(
+            "DELETE FROM tasks WHERE date=%s AND (original_date IS NULL OR original_date=%s)",
+            (today, today)
+        )
+        for t, p in tasks:
+            db_execute(
+                "INSERT INTO tasks (text, priority, date, original_date) VALUES (%s,%s,%s,%s)",
+                (t, p, today, today)
             )
-            for t, p in tasks:
-                c.execute(
-                    "INSERT INTO tasks (text, priority, date, original_date) VALUES (?,?,?,?)",
-                    (t, p, today, today)
-                )
 
         bot_state["mode"] = STATE_IDLE
         kb = build_task_kb(today)
@@ -486,8 +510,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         priority = 1 if text.startswith("!") else 0
         new_text = text.lstrip("! ").strip()
         if tid and new_text:
-            with sqlite3.connect("bot.db") as c:
-                c.execute("UPDATE tasks SET text=?, priority=? WHERE id=?", (new_text, priority, tid))
+            db_execute("UPDATE tasks SET text=%s, priority=%s WHERE id=%s", (new_text, priority, tid))
         bot_state.update({"mode": STATE_IDLE, "temp": {}})
         kb = build_task_kb(today_str())
         await update.message.reply_text("✅ Задача обновлена!", reply_markup=kb)
@@ -495,8 +518,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сохранение заметки
     elif mode == STATE_ADDING_NOTE:
         now_str = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
-        with sqlite3.connect("bot.db") as c:
-            c.execute("INSERT INTO notes (text, created_at) VALUES (?,?)", (text, now_str))
+        db_execute("INSERT INTO notes (text, created_at) VALUES (%s,%s)", (text, now_str))
         bot_state["mode"] = STATE_IDLE
         await update.message.reply_text(
             "📓 Заметка сохранена!\n\nНажми *📓 Заметки* чтобы посмотреть все.",
@@ -505,8 +527,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Добавление привычки
     elif mode == STATE_ADDING_HABIT:
-        with sqlite3.connect("bot.db") as c:
-            c.execute("INSERT INTO habits (name) VALUES (?)", (text,))
+        db_execute("INSERT INTO habits (name) VALUES (%s)", (text,))
         bot_state["mode"] = STATE_IDLE
         await update.message.reply_text(
             f"✅ Привычка добавлена: *{text}*",
@@ -519,10 +540,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tomorrow = tomorrow_str()
         low = text.lower()
 
-        with sqlite3.connect("bot.db") as c:
-            undone = c.execute(
-                "SELECT id, text, original_date, priority FROM tasks WHERE date=? AND done=0", (today,)
-            ).fetchall()
+        undone = db_fetchall(
+            "SELECT id, text, original_date, priority FROM tasks WHERE date=%s AND done=0", (today,)
+        )
 
         if not undone or low in ["нет", "ничего", "-", "no", "0"]:
             bot_state["mode"] = STATE_IDLE
@@ -533,12 +553,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    [undone[i] for i in [int(n)-1 for n in re.findall(r'\d+', text)] if 0 <= i < len(undone)]
 
         if to_carry:
-            with sqlite3.connect("bot.db") as c:
-                for _, t, orig, prio in to_carry:
-                    c.execute(
-                        "INSERT INTO tasks (text, priority, date, original_date) VALUES (?,?,?,?)",
-                        (t, prio, tomorrow, orig or today)
-                    )
+            for _, t, orig, prio in to_carry:
+                db_execute(
+                    "INSERT INTO tasks (text, priority, date, original_date) VALUES (%s,%s,%s,%s)",
+                    (t, prio, tomorrow, orig or today)
+                )
             names = "\n".join(f"• {t[1]}" for t in to_carry)
             await update.message.reply_text(
                 f"📅 Перенёс на завтра ({tomorrow}):\n{names}\n\nХорошего вечера! 🌙"
@@ -561,8 +580,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             dt = MOSCOW_TZ.localize(datetime.strptime(text, "%d.%m.%Y %H:%M"))
             rem_text = bot_state["temp"].get("rem_text", "")
-            with sqlite3.connect("bot.db") as c:
-                c.execute("INSERT INTO reminders (text, remind_at) VALUES (?,?)", (rem_text, dt.isoformat()))
+            db_execute("INSERT INTO reminders (text, remind_at) VALUES (%s,%s)", (rem_text, dt.isoformat()))
             bot_state.update({"mode": STATE_IDLE, "temp": {}})
             await update.message.reply_text(f"✅ Напоминание сохранено!\n📝 {rem_text}\n🕐 {text} (МСК)")
         except ValueError:
@@ -631,17 +649,16 @@ async def send_weekly_review(app, update=None):
     today   = datetime.now(MOSCOW_TZ)
     total_done = total_tasks = 0
 
-    with sqlite3.connect("bot.db") as c:
-        for i in range(7):
-            d = (today - timedelta(days=i)).strftime("%d.%m.%Y")
-            total_done  += c.execute("SELECT COUNT(*) FROM tasks WHERE date=? AND done=1", (d,)).fetchone()[0]
-            total_tasks += c.execute("SELECT COUNT(*) FROM tasks WHERE date=?", (d,)).fetchone()[0]
-        week_ago = (today - timedelta(days=7)).strftime("%d.%m.%Y")
-        carried  = c.execute("""
-            SELECT text, COUNT(*) as cnt FROM tasks
-            WHERE original_date != date AND original_date IS NOT NULL AND date >= ?
-            GROUP BY text ORDER BY cnt DESC LIMIT 3
-        """, (week_ago,)).fetchall()
+    for i in range(7):
+        d = (today - timedelta(days=i)).strftime("%d.%m.%Y")
+        total_done  += db_fetchone("SELECT COUNT(*) FROM tasks WHERE date=%s AND done=1", (d,))[0]
+        total_tasks += db_fetchone("SELECT COUNT(*) FROM tasks WHERE date=%s", (d,))[0]
+    week_ago = (today - timedelta(days=7)).strftime("%d.%m.%Y")
+    carried  = db_fetchall("""
+        SELECT text, COUNT(*) as cnt FROM tasks
+        WHERE original_date != date AND original_date IS NOT NULL AND date >= %s
+        GROUP BY text ORDER BY cnt DESC LIMIT 3
+    """, (week_ago,))
 
     pct   = int(total_done / total_tasks * 100) if total_tasks else 0
     emoji = "🔥" if pct >= 80 else "👍" if pct >= 50 else "💪"
@@ -663,21 +680,20 @@ async def job_reminders(app):
     if not chat_id:
         return
     now = datetime.now(MOSCOW_TZ)
-    with sqlite3.connect("bot.db") as c:
-        rows = c.execute("SELECT id, text, remind_at FROM reminders WHERE sent=0").fetchall()
-        for rid, text, rat in rows:
-            try:
-                dt = datetime.fromisoformat(rat)
-                if dt.tzinfo is None:
-                    dt = MOSCOW_TZ.localize(dt)
-                if now >= dt:
-                    await app.bot.send_message(
-                        chat_id=int(chat_id),
-                        text=f"🔔 *Напоминание:* {text}", parse_mode="Markdown"
-                    )
-                    c.execute("UPDATE reminders SET sent=1 WHERE id=?", (rid,))
-            except Exception as e:
-                logging.error(f"Reminder error: {e}")
+    rows = db_fetchall("SELECT id, text, remind_at FROM reminders WHERE sent=0")
+    for rid, text, rat in rows:
+        try:
+            dt = datetime.fromisoformat(rat)
+            if dt.tzinfo is None:
+                dt = MOSCOW_TZ.localize(dt)
+            if now >= dt:
+                await app.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=f"🔔 *Напоминание:* {text}", parse_mode="Markdown"
+                )
+                db_execute("UPDATE reminders SET sent=1 WHERE id=%s", (rid,))
+        except Exception as e:
+            logging.error(f"Reminder error: {e}")
 
 
 # ════════════════════════════════════
@@ -707,6 +723,20 @@ def main():
     scheduler.add_job(send_weekly_review, "cron", day_of_week="sun",         hour=20, minute=0, args=[app])
     scheduler.add_job(job_reminders,      "interval", minutes=1,                                args=[app])
     scheduler.start()
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("start",     "👋 Главное меню и справка"),
+            ("tasks",     "📋 Задачи на сегодня"),
+            ("newtasks",  "➕ Добавить новые задачи"),
+            ("habits",    "💪 Привычки и streak"),
+            ("notes",     "📓 Заметки"),
+            ("weekly",    "📊 Обзор недели"),
+            ("reminder",  "🔔 Добавить напоминание"),
+            ("reminders", "📆 Все напоминания"),
+        ])
+
+    app.post_init = post_init
 
     logging.info("✅ Бот запущен!")
     app.run_polling(drop_pending_updates=True)
