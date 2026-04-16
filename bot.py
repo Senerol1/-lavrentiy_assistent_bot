@@ -178,8 +178,7 @@ def main_menu():
             [KeyboardButton("🔔 Напоминание"), KeyboardButton("📆 Напоминания")],
             [KeyboardButton("📊 Обзор недели")],
         ],
-        resize_keyboard=True,
-        persistent=True
+        resize_keyboard=True
     )
 
 def build_task_kb(date):
