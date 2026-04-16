@@ -108,7 +108,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 10:00 — запрошу список задач на день\n"
         "• 12:00 — напомню выпить таблетки 💊\n"
         "• 18:00 — спрошу что перенести на завтра\n\n"
-        "📋 /tasks — задачи на сегодня\n"
+        "📋 /newtasks — добавить задачи прямо сейчас\n"
+        "📋 /tasks — чеклист на сегодня\n"
         "🔔 /reminder — добавить напоминание\n"
         "📆 /reminders — все напоминания",
         parse_mode="Markdown"
@@ -124,6 +125,10 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 *Задачи на {today}:*\n_(нажми чтобы отметить)_",
         reply_markup=kb, parse_mode="Markdown"
     )
+
+async def cmd_newtasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_state["mode"] = STATE_WAITING_TASKS
+    await update.message.reply_text("📝 Пришли список задач на сегодня — каждая с новой строки:")
 
 async def cmd_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_state["mode"] = STATE_WAITING_REM_TEXT
@@ -365,6 +370,7 @@ def main():
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("tasks",     cmd_tasks))
+    app.add_handler(CommandHandler("newtasks",  cmd_newtasks))
     app.add_handler(CommandHandler("reminder",  cmd_reminder))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CallbackQueryHandler(handle_toggle, pattern=r"^t_\d+$"))
