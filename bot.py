@@ -507,7 +507,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не смог разобрать. Каждая задача — с новой строки.")
             return
 
-        )
         for t, p in tasks:
             db_execute(
                 "INSERT INTO tasks (text, priority, date, original_date) VALUES (%s,%s,%s,%s)",
