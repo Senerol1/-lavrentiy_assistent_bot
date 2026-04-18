@@ -507,9 +507,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не смог разобрать. Каждая задача — с новой строки.")
             return
 
-        db_execute(
-            "DELETE FROM tasks WHERE date=%s AND (original_date IS NULL OR original_date=%s) AND done=0",
-            (today, today)
         )
         for t, p in tasks:
             db_execute(
