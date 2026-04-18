@@ -75,7 +75,8 @@ def init_db():
                     done          INTEGER DEFAULT 0,
                     priority      INTEGER DEFAULT 0,
                     date          TEXT    NOT NULL,
-                    original_date TEXT
+                    original_date TEXT,
+                    completed_at  TEXT
                 )
             """)
             cur.execute("""
@@ -114,6 +115,8 @@ def init_db():
                     value TEXT
                 )
             """)
+            # Миграции
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TEXT")
 
 def get_setting(key):
     row = db_fetchone("SELECT value FROM settings WHERE key=%s", (key,))
@@ -174,9 +177,9 @@ def main_menu():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📋 Задачи"),      KeyboardButton("➕ Новые задачи")],
-            [KeyboardButton("💪 Привычки"),    KeyboardButton("📓 Заметки")],
-            [KeyboardButton("🔔 Напоминание"), KeyboardButton("📆 Напоминания")],
-            [KeyboardButton("📊 Обзор недели")],
+            [KeyboardButton("✅ Выполненные"),  KeyboardButton("💪 Привычки")],
+            [KeyboardButton("📓 Заметки"),      KeyboardButton("🔔 Напоминание")],
+            [KeyboardButton("📆 Напоминания"),  KeyboardButton("📊 Обзор недели")],
         ],
         resize_keyboard=True
     )
@@ -306,6 +309,23 @@ async def cmd_add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_state["mode"] = STATE_ADDING_NOTE
         await update.message.reply_text("📓 Напиши заметку — сохраню с датой и временем:")
 
+async def cmd_done_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db_fetchall("""
+        SELECT text, completed_at, date FROM tasks
+        WHERE done=1 ORDER BY completed_at DESC NULLS LAST LIMIT 30
+    """)
+    if not rows:
+        await update.message.reply_text("Выполненных задач пока нет.")
+        return
+    lines = []
+    for text, completed_at, date in rows:
+        when = completed_at if completed_at else date
+        lines.append(f"✅ {text}\n   _{when}_")
+    await update.message.reply_text(
+        "*Выполненные задачи (последние 30):*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown"
+    )
+
 async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_weekly_review(context.application, update=update)
 
@@ -334,9 +354,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отметить задачу выполненной
     if data.startswith("done_"):
         tid = int(data.split("_")[1])
+        now_str = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
         row = db_fetchone("SELECT date FROM tasks WHERE id=%s", (tid,))
         if row:
-            db_execute("UPDATE tasks SET done=1 WHERE id=%s", (tid,))
+            db_execute("UPDATE tasks SET done=1, completed_at=%s WHERE id=%s", (now_str, tid))
             date = row[0]
         await query.answer("✅ Выполнено!")
         kb = build_task_kb(date)
@@ -459,6 +480,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_map = {
         "📋 Задачи":         cmd_tasks,
         "➕ Новые задачи":   cmd_newtasks,
+        "✅ Выполненные":    cmd_done_tasks,
         "💪 Привычки":       cmd_habits,
         "📓 Заметки":        cmd_add_note,
         "🔔 Напоминание":    cmd_reminder,
@@ -486,7 +508,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         db_execute(
-            "DELETE FROM tasks WHERE date=%s AND (original_date IS NULL OR original_date=%s)",
+            "DELETE FROM tasks WHERE date=%s AND (original_date IS NULL OR original_date=%s) AND done=0",
             (today, today)
         )
         for t, p in tasks:
@@ -706,6 +728,7 @@ def main():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("tasks",     cmd_tasks))
     app.add_handler(CommandHandler("newtasks",  cmd_newtasks))
+    app.add_handler(CommandHandler("done",      cmd_done_tasks))
     app.add_handler(CommandHandler("habits",    cmd_habits))
     app.add_handler(CommandHandler("notes",     cmd_add_note))
     app.add_handler(CommandHandler("weekly",    cmd_weekly))
@@ -728,6 +751,7 @@ def main():
             ("start",     "👋 Главное меню и справка"),
             ("tasks",     "📋 Задачи на сегодня"),
             ("newtasks",  "➕ Добавить новые задачи"),
+            ("done",      "✅ Выполненные задачи"),
             ("habits",    "💪 Привычки и streak"),
             ("notes",     "📓 Заметки"),
             ("weekly",    "📊 Обзор недели"),
